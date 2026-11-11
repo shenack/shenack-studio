@@ -259,6 +259,7 @@ Aujourd'hui je vais vous montrer comment reprendre le contrôle de votre trésor
         <div id="suggestBox" class="tracks" style="margin-bottom:8px"></div>
         <select id="musicSel"><option value="">Aucune musique</option></select>
         <label class="btn sm" style="display:inline-block;margin-top:8px;cursor:pointer">🎵 Importer une musique<input type="file" id="musicFile" accept="audio/*" hidden></label>
+        <div class="hint" id="musicInfo" style="margin-top:6px"></div>
         <label>Volume de la voix</label><input type="range" id="volVoice" min="0" max="150" value="100">
         <label>Volume de la musique</label><input type="range" id="volMusic" min="0" max="100" value="14">
         <div class="hint">Astuce : garde la musique entre 10 et 20 % pour qu'elle reste sous ta voix.</div>
@@ -328,7 +329,7 @@ Aujourd'hui je vais vous montrer comment reprendre le contrôle de votre trésor
 </div>
 
 <script type="module">
-const APP_VERSION='2.4';
+const APP_VERSION='2.5';
 // =====================================================================
 // Utilities
 // =====================================================================
@@ -1159,6 +1160,29 @@ function audioGraph(){
 $('#volVoice').oninput=()=>audioGraph.g&&(audioGraph.g.voice.gain.value=$('#volVoice').value/100);
 $('#volMusic').oninput=()=>audioGraph.g&&(audioGraph.g.music.gain.value=$('#volMusic').value/100);
 
+// ---------- l'instru dure toujours autant que la vidéo ----------
+function loopBuffer(src,T){
+  const sr=src.sampleRate,N=Math.ceil(T*sr),L=src.length,ch=src.numberOfChannels,out=new AudioBuffer({numberOfChannels:2,length:N,sampleRate:sr});
+  const cut=Math.min(Math.round(2.5*sr),Math.floor(L/4)),xf=Math.min(Math.round(1.5*sr),Math.floor(L/6)); // on évite les fondus d'origine
+  for(let c=0;c<2;c++){const s=src.getChannelData(Math.min(c,ch-1)),d=out.getChannelData(c);let pos=0;
+    for(let i=0;i<L-cut&&pos<N;i++)d[pos++]=s[i];
+    while(pos<N){const start=pos;for(let i=Math.round(.6*sr);i<L-cut&&pos<N;i++){let v=s[i];const k=pos-start;if(k<xf){const w=k/xf;v=v*w+d[pos]*(1-w)+ (start-xf+k>=0?0:0);}d[pos++]=v;}}
+    const fo=Math.min(Math.round(2.5*sr),N);for(let i=0;i<fo;i++)d[N-1-i]*=i/fo;}
+  return out;
+}
+async function fitTrack(track,T){
+  if(track.buffer.duration>=T-.3)return track.buffer;
+  const key=Math.ceil(T);if(track.fitted&&track.fitted.key===key)return track.fitted.buf;
+  $('#eStatus').textContent='🎵 J’allonge l’instru à la durée de ta vidéo…';await new Promise(r=>setTimeout(r,30));
+  let buf;
+  if(track.seed&&STY[track.style])buf=await generate(track.style,track.bpm,key+1,track.seed,track.energy??55); // même instru, recomposée à la bonne durée
+  else buf=loopBuffer(track.buffer,key+1); // musique importée : bouclée en fondu enchaîné
+  track.fitted={key,buf};$('#eStatus').textContent='';return buf;
+}
+function musicInfo(){const t=tracks.find(x=>x.id==$('#musicSel').value),el=$('#musicInfo');if(!el)return;
+  if(!t||!clips.length){el.textContent='';return;}const T=total();
+  el.textContent=t.buffer.duration>=T-.3?`✅ L’instru (${fmtT(t.buffer.duration)}) couvre toute la vidéo (${fmtT(T)}).`:`🔁 L’instru (${fmtT(t.buffer.duration)}) est plus courte que la vidéo (${fmtT(T)}) : elle sera allongée automatiquement.`;}
+setInterval(musicInfo,1500);
 async function play(exportMode=false,startAt=0){
   if(!clips.length){toast('Ajoute au moins une prise');return;}
   if(exportMode)startAt=0;
@@ -1166,8 +1190,9 @@ async function play(exportMode=false,startAt=0){
   const W=edit.width,H=edit.height,T=total();
   // music
   let msrc=null;const mid=$('#musicSel').value;const track=tracks.find(t=>t.id==mid);
-  if(track){msrc=ctx.createBufferSource();msrc.buffer=track.buffer;msrc.loop=true;const mg=ctx.createGain();msrc.connect(mg);mg.connect(g.music);
-    const n=ctx.currentTime,rem=Math.max(.1,T-startAt);mg.gain.setValueAtTime(startAt>0?1:0,n);if(!startAt)mg.gain.linearRampToValueAtTime(1,n+1);mg.gain.setValueAtTime(1,n+Math.max(1.1,rem-2));mg.gain.linearRampToValueAtTime(0,n+rem);msrc.start(0,startAt%track.buffer.duration);}
+  const mbuf=track?await fitTrack(track,T):null;
+  if(track){msrc=ctx.createBufferSource();msrc.buffer=mbuf;msrc.loop=false;const mg=ctx.createGain();msrc.connect(mg);mg.connect(g.music);
+    const n=ctx.currentTime,rem=Math.max(.1,T-startAt);mg.gain.setValueAtTime(startAt>0?1:0,n);if(!startAt)mg.gain.linearRampToValueAtTime(1,n+1);mg.gain.setValueAtTime(1,n+Math.max(1.1,rem-2));mg.gain.linearRampToValueAtTime(0,n+rem);msrc.start(0,Math.min(startAt,mbuf.duration-.05));}
   let rec=null,ch=[];
   if(exportMode){const st=edit.captureStream(30);g.dest.stream.getAudioTracks().forEach(t=>st.addTrack(t));
     rec=new MediaRecorder(st,MIME?{mimeType:MIME,videoBitsPerSecond:10e6,audioBitsPerSecond:192e3}:{});rec.ondataavailable=e=>e.data.size&&ch.push(e.data);
@@ -1427,7 +1452,7 @@ const counts={};
 async function genOne(style,bpm,dur,E){
   const st=STYLES.find(s=>s.id===style),seed=Math.floor(Math.random()*2e9)+3;
   const buf=await generate(style,bpm,dur,seed,E);counts[style]=(counts[style]||0)+1;
-  tracks.push({id:String(Date.now()+Math.random()),name:`${st.name} #${counts[style]} · ${buf.keyName}`,style,bpm,dur,buffer:buf});
+  tracks.push({id:String(Date.now()+Math.random()),name:`${st.name} #${counts[style]} · ${buf.keyName}`,style,bpm,dur,buffer:buf,seed,energy:E});
 }
 async function runGen(n,random){
   const btns=['#iGen','#iMulti','#iVar'];btns.forEach(b=>$(b).disabled=true);
@@ -1450,8 +1475,8 @@ $('#suggest').onclick=async()=>{
   box.innerHTML='<div class="hint">🎹 Création de 3 instrus de '+dur+' s…</div>';
   const pick=[['corporate',112],['lofi',84],['afro',104],['minimal',90],['motivation',140],['cinema',76],['gospel',78]].sort(()=>Math.random()-.5).slice(0,3);
   const made=[];
-  for(const [st,bpm] of pick){const buf=await generate(st,bpm,dur,Math.floor(Math.random()*1e6)+2,55);const name=STYLES.find(x=>x.id===st).name;
-    const t={id:String(Date.now()+Math.random()),name:name+' (proposée)',style:st,bpm,dur,buffer:buf};tracks.push(t);made.push(t);}
+  for(const [st,bpm] of pick){const seed=Math.floor(Math.random()*1e6)+2;const buf=await generate(st,bpm,dur,seed,55);const name=STYLES.find(x=>x.id===st).name;
+    const t={id:String(Date.now()+Math.random()),name:name+' (proposée)',style:st,bpm,dur,buffer:buf,seed,energy:55};tracks.push(t);made.push(t);}
   renderTracks();box.innerHTML='';
   made.forEach(t=>{const d=document.createElement('div');d.className='track';d.innerHTML=`<button class="btn sm pl">▶︎</button><div class="nm"><b>${t.name.replace(' (proposée)','')}</b><small>${t.bpm} BPM · ${t.dur} s</small></div><button class="btn sm gold ch">Choisir</button>`;
     let src=null;d.querySelector('.pl').onclick=async e=>{const c=AC();await c.resume();if(src){try{src.stop();}catch(_){}src=null;e.target.textContent='▶︎';return;}src=c.createBufferSource();src.buffer=t.buffer;src.connect(c.destination);src.start();e.target.textContent='■';src.onended=()=>{src=null;e.target.textContent='▶︎';};};
@@ -1479,7 +1504,7 @@ async function persistTracks(){for(const t of tracks){if(!t.mediaId){t.mediaId='
 function projectState(){return {v:1,
   takes:takes.map(t=>({mediaId:t.mediaId,name:t.name,dur:t.dur,fmt:t.fmt,subs:t.subs||[]})).filter(t=>t.mediaId),
   clips:clips.filter(c=>c.mediaId).map(c=>({mediaId:c.mediaId,name:c.name,in:c.in,out:c.out,dur:c.dur})),
-  subs, tracks:tracks.filter(t=>t.mediaId).map(t=>({id:t.id,mediaId:t.mediaId,name:t.name,style:t.style,bpm:t.bpm,dur:t.dur})),
+  subs, tracks:tracks.filter(t=>t.mediaId).map(t=>({id:t.id,mediaId:t.mediaId,name:t.name,style:t.style,bpm:t.bpm,dur:t.dur,seed:t.seed,energy:t.energy})),
   music:$('#musicSel').value, ebg:EBG, fmt:FMT, subStyle,
   set:{volVoice:$('#volVoice').value,volMusic:$('#volMusic').value,subY:$('#subY').value,subSize:$('#subSize').value,fadeIO:$('#fadeIO').checked,endCard:$('#endCard').checked,endText:$('#endText').value,autoMood:$('#autoMood').value,dof:$('#dof').value}};}
 async function autosave(){
@@ -1502,7 +1527,7 @@ async function restoreProject(){
     const urls={};
     for(const c of st.clips||[]){if(!urls[c.mediaId]){const b=await blobOf(c.mediaId);if(!b)continue;urls[c.mediaId]=URL.createObjectURL(b);}
       await addClip(urls[c.mediaId],c.dur,c.name,[],null,c.mediaId,[c.in,c.out]);}
-    for(const t of st.tracks||[]){const b=await blobOf(t.mediaId);if(!b)continue;try{const buf=await AC().decodeAudioData(await b.arrayBuffer());tracks.push({id:t.id,name:t.name,style:t.style,bpm:t.bpm,dur:t.dur,buffer:buf,mediaId:t.mediaId});}catch(e){}}
+    for(const t of st.tracks||[]){const b=await blobOf(t.mediaId);if(!b)continue;try{const buf=await AC().decodeAudioData(await b.arrayBuffer());tracks.push({id:t.id,name:t.name,style:t.style,bpm:t.bpm,dur:t.dur,buffer:buf,mediaId:t.mediaId,seed:t.seed,energy:t.energy});}catch(e){}}
     renderTracks();
     subs=st.subs||[];renderSubs();
     if(st.music&&tracks.find(t=>t.id===st.music))$('#musicSel').value=st.music;
@@ -1552,7 +1577,7 @@ $('#btnFlip').onclick=async()=>{if(recording)return;facing=facing==='user'?'envi
 listDevices();if(navigator.mediaDevices)navigator.mediaDevices.ondevicechange=listDevices;
 if(!navigator.mediaDevices||!window.MediaRecorder){$('#status').textContent='⚠️ Ce navigateur ne permet pas d’enregistrer. Utilise Google Chrome sur ordinateur.';}
 $('#edit').width=1080;$('#edit').height=1920;drawEditIdle();
-window.__studio={maskC,addClip,generate,tracks,clips,play,subs:()=>subs,setSubs:s=>{subs=s;renderSubs();},MIME};
+window.__studio={fitTrack,loopBuffer,maskC,addClip,generate,tracks,clips,play,subs:()=>subs,setSubs:s=>{subs=s;renderSubs();},MIME};
 </script>
 </body>
 </html>
