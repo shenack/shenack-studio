@@ -251,6 +251,10 @@ Aujourd'hui je vais vous montrer comment reprendre le contrôle de votre trésor
         <h3>Sous-titres</h3>
         <button class="btn gold sm" id="subAI" style="width:100%">✨ Générer les sous-titres automatiquement (IA)</button>
         <div class="chk"><input type="checkbox" id="subAtExport" checked> Les générer automatiquement à l'export s'il n'y en a pas</div>
+        <label>Qualité de la transcription</label>
+        <div class="seg" id="asrQ"><button data-q="base">Rapide</button><button data-q="small" class="on">Précise</button><button data-q="turbo">Très précise</button></div>
+        <label>Mots à bien écrire (noms, termes métier), séparés par des virgules</label>
+        <input type="text" id="asrWords" value="Shenack, Shenack Consulting, trésorerie, prévisionnel, TVA, URSSAF, bilan, Gospel, Maison MDC">
         <div class="hint" id="subAIStatus" style="margin-bottom:8px">L'IA écoute ta voix et écrit les sous-titres, calés sur le montage. Tu peux ensuite corriger chaque ligne.</div>
         <button class="btn sm" id="subAdd">➕ Ajouter une ligne à la position actuelle</button>
         <div style="display:grid;grid-template-columns:70px 70px 1fr 32px;gap:6px;margin:10px 0 4px" class="hint"><span>Début (s)</span><span>Fin (s)</span><span>Texte</span><span></span></div>
@@ -307,7 +311,7 @@ Aujourd'hui je vais vous montrer comment reprendre le contrôle de votre trésor
 </div>
 
 <script type="module">
-const APP_VERSION='1.9';
+const APP_VERSION='2.0';
 // =====================================================================
 // Utilities
 // =====================================================================
@@ -831,16 +835,37 @@ renderSubs();
 let curT=0;
 $('#subAdd').onclick=()=>{subs.push({start:curT,end:curT+2.5,text:'Ton texte ici'});renderSubs();};
 // ---------- sous-titres automatiques (IA Whisper, sur l'ordinateur) ----------
-let asr=null;
+let asr=null,asrModel='',ASRQ='small';
+const ASR_MODELS={base:['Xenova/whisper-base','≈ 80 Mo'],small:['Xenova/whisper-small','≈ 250 Mo'],turbo:['onnx-community/whisper-large-v3-turbo','≈ 600 Mo']};
+$$('#asrQ button').forEach(b=>b.onclick=()=>{ASRQ=b.dataset.q;$$('#asrQ button').forEach(x=>x.classList.toggle('on',x===b));});
+try{const w=localStorage.getItem('asrWords');if(w)$('#asrWords').value=w;}catch(e){}
+$('#asrWords').addEventListener('change',()=>{try{localStorage.setItem('asrWords',$('#asrWords').value);}catch(e){}});
 async function getASR(st){
-  if(asr) return asr;
-  st('⏳ Chargement de l’IA de transcription… (la première fois, téléchargement d’environ 80 Mo, ensuite c’est instantané)');
+  const [id,size]=ASR_MODELS[ASRQ];
+  if(asr&&asrModel===id) return asr;
+  st(`⏳ Chargement de l’IA de transcription… (la première fois, téléchargement ${size}, ensuite c’est instantané)`);
   const T=await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1');
   T.env.allowLocalModels=false;
   const files={};
-  asr=await T.pipeline('automatic-speech-recognition','Xenova/whisper-base',{dtype:'q8',device:'wasm',
-    progress_callback:p=>{if(p.status==='progress'&&p.total){files[p.file]=[p.loaded,p.total];const L=Object.values(files).reduce((a,x)=>a+x[0],0),Tt=Object.values(files).reduce((a,x)=>a+x[1],0);st(`⏳ Téléchargement de l’IA de transcription : ${Math.round(L/Tt*100)} % (une seule fois)`);}}});
-  return asr;
+  const prog=p=>{if(p.status==='progress'&&p.total){files[p.file]=[p.loaded,p.total];const L=Object.values(files).reduce((a,x)=>a+x[0],0),Tt=Object.values(files).reduce((a,x)=>a+x[1],0);st(`⏳ Téléchargement de l’IA de transcription : ${Math.round(L/Tt*100)} % (une seule fois)`);}};
+  const gpu=!!navigator.gpu&&ASRQ!=='base';
+  try{asr=await T.pipeline('automatic-speech-recognition',id,gpu?{device:'webgpu',dtype:{encoder_model:'fp16',decoder_model_merged:'q4'},progress_callback:prog}:{dtype:'q8',device:'wasm',progress_callback:prog});}
+  catch(e){asr=await T.pipeline('automatic-speech-recognition',id,{dtype:'q8',device:'wasm',progress_callback:prog});}
+  asrModel=id;return asr;
+}
+// correction du texte : mots métier, ponctuation française, majuscules
+function lev(a,b){const m=a.length,n=b.length,d=[...Array(n+1).keys()];for(let i=1;i<=m;i++){let p=d[0];d[0]=i;for(let j=1;j<=n;j++){const t=d[j];d[j]=Math.min(d[j]+1,d[j-1]+1,p+(a[i-1]===b[j-1]?0:1));p=t;}}return d[n];}
+const norm=w=>w.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'');
+function fixText(t){
+  const words=$('#asrWords').value.split(',').map(x=>x.trim()).filter(Boolean);
+  // expressions de plusieurs mots : remplacement insensible à la casse
+  words.filter(w=>w.includes(' ')).forEach(w=>{const re=new RegExp(w.split(' ').map(x=>x.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('\\s+'),'gi');t=t.replace(re,w);});
+  const single=words.filter(w=>!w.includes(' '));
+  t=t.replace(/[\p{L}'’-]+/gu,tok=>{const n=norm(tok);for(const w of single){const nw=norm(w);if(n===nw)return w;if(nw.length>=5&&Math.abs(n.length-nw.length)<=2&&lev(n,nw)<=Math.floor(nw.length/4))return w;}return tok;});
+  words.filter(w=>w.includes(' ')).forEach(w=>{const re=new RegExp(w.split(' ').map(x=>x.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('\\s+'),'gi');t=t.replace(re,w);});
+  t=t.replace(/\s+([,.])/g,'$1').replace(/\s*([?!:;])/g,' $1').replace(/\s{2,}/g,' ').replace(/\s*…/g,'…').trim();
+  t=t.replace(/(^|[.!?…]\s+)(\p{Ll})/gu,(m,a,c)=>a+c.toUpperCase());
+  return t;
 }
 async function clipAudio16k(c){
   const ab=await (await fetch(c.url)).arrayBuffer();
@@ -860,7 +885,7 @@ async function generateSubs(){
       let audio;try{audio=await clipAudio16k(c);}catch(e){off+=c.out-c.in;continue;}
       const r=await model(audio,{language:'french',task:'transcribe',chunk_length_s:30,stride_length_s:5,return_timestamps:true});
       const ch=(r.chunks&&r.chunks.length)?r.chunks:[{timestamp:[0,c.out-c.in],text:r.text||''}];
-      ch.forEach(k=>{const t=(k.text||'').trim();if(!t||/^\[.*\]$|^\(.*\)$/.test(t))return;const a=k.timestamp[0]??0,b=k.timestamp[1]??Math.min(c.out-c.in,a+3);
+      ch.forEach(k=>{const t=fixText((k.text||'').trim());if(!t||/^\[.*\]$|^\(.*\)$/.test(t))return;const a=k.timestamp[0]??0,b=k.timestamp[1]??Math.min(c.out-c.in,a+3);
         splitSub(off+a,off+Math.max(a+.4,b),t).forEach(x=>out.push(x));});
       off+=c.out-c.in;}
     subs=out;renderSubs();drawEditIdle();
