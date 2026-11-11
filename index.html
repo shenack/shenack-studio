@@ -86,6 +86,7 @@ input[type=range]{width:100%;accent-color:var(--gold)}
 .track .nm small{display:block;color:var(--mut);font-size:11px}
 a.dl{color:var(--gold2);font-weight:700}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--gold);color:var(--navy);padding:10px 18px;border-radius:999px;font-weight:700;display:none;z-index:50}
+@media(max-width:700px){header{padding:8px 10px!important;gap:8px!important}.brand{font-size:14px!important}.brand small{display:none}.brand .sc{width:30px;height:30px;font-size:12px}#verPill{display:none}nav{gap:4px!important}nav button{padding:7px 10px!important;font-size:12px}main{padding:10px!important}.stage{min-height:auto!important;padding:8px!important}.stage canvas{max-height:62vh!important}#btnUpd{display:none!important}}
 </style>
 </head>
 <body>
@@ -112,6 +113,7 @@ a.dl{color:var(--gold2);font-weight:700}
       </div>
       <div class="recbar">
         <button class="btn" id="btnCam">📷 Activer la caméra</button>
+        <button class="btn" id="btnFlip" style="display:none">🔄 Avant / Arrière</button>
         <button class="btn" id="btnPrompt">📜 Prompteur</button>
         <button class="recbtn" id="btnRec" title="Enregistrer" disabled><span></span></button>
         <div class="timer" id="timer">00:00</div>
@@ -309,6 +311,7 @@ Aujourd'hui je vais vous montrer comment reprendre le contrôle de votre trésor
 </section>
 </main>
 <svg width="0" height="0" style="position:absolute"><filter id="pro" color-interpolation-filters="sRGB"><feColorMatrix id="proCM" type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0"/><feConvolveMatrix id="proSH" order="3" kernelMatrix="0 0 0 0 1 0 0 0 0" divisor="1" bias="0" edgeMode="duplicate" preserveAlpha="true"/></filter></svg>
+<div id="vrack" style="position:fixed;left:0;bottom:0;width:4px;height:4px;overflow:hidden;opacity:.02;pointer-events:none;z-index:-1"></div>
 <div class="toast" id="toast"></div>
 <div id="updPanel" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:60;place-items:center">
   <div class="card" style="width:min(460px,92vw)">
@@ -321,7 +324,7 @@ Aujourd'hui je vais vous montrer comment reprendre le contrôle de votre trésor
 </div>
 
 <script type="module">
-const APP_VERSION='2.1';
+const APP_VERSION='2.3';
 // =====================================================================
 // Utilities
 // =====================================================================
@@ -510,8 +513,13 @@ function makeBg(id,W,H){
 function makeComp(){try{
   const c=document.createElement('canvas'),gl=c.getContext('webgl',{premultipliedAlpha:false,antialias:false,preserveDrawingBuffer:true});if(!gl)return null;
   const vs='attribute vec2 p;varying vec2 uv;void main(){uv=p*.5+.5;gl_Position=vec4(p,0.,1.);}';
-  const fsA='precision mediump float;varying vec2 uv;uniform sampler2D cur,prev;uniform float k;void main(){float m=texture2D(cur,uv).a;float o=texture2D(prev,uv).r;float v=mix(o,m,k);gl_FragColor=vec4(v,v,v,1.);}';
-  const fsB=`precision mediump float;varying vec2 uv;uniform sampler2D cam,msk,bg,bgs;uniform vec2 px;uniform vec3 tint;uniform float r,lo,hi,harm,wrap,grain,seed,dark;
+  const fsA='#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\nvarying vec2 uv;uniform sampler2D cur,prev;uniform float k;void main(){float m=texture2D(cur,uv).a;float o=texture2D(prev,uv).r;float v=mix(o,m,k);gl_FragColor=vec4(v,v,v,1.);}';
+  const fsB=`#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec2 uv;uniform sampler2D cam,msk,bg,bgs;uniform vec2 px;uniform vec3 tint;uniform float r,lo,hi,harm,wrap,grain,seed,dark;
     float M(vec2 o){return texture2D(msk,uv+o*px*r).r;}
     void main(){
       float m=(M(vec2(0.))*4.+M(vec2(1.,0.))+M(vec2(-1.,0.))+M(vec2(0.,1.))+M(vec2(0.,-1.))+M(vec2(.7,.7))+M(vec2(-.7,.7))+M(vec2(.7,-.7))+M(vec2(-.7,-.7)))/12.;
@@ -522,7 +530,7 @@ function makeComp(){try{
       float w=clamp(a*(1.-a)*4.,0.,1.);
       p=1.-(1.-p)*(1.-s*w*wrap);
       vec3 o=mix(b,p,a);
-      float n=fract(sin(dot(uv*vec2(12.9898,78.233)+seed,vec2(1.,1.)))*43758.5453)-.5;
+      vec2 q=gl_FragCoord.xy+seed;float n=fract(52.9829189*fract(dot(q,vec2(.06711056,.00583715))))-.5;
       gl_FragColor=vec4(o+n*grain,1.);}`;
   const sh=(t,src)=>{const x=gl.createShader(t);gl.shaderSource(x,src);gl.compileShader(x);if(!gl.getShaderParameter(x,gl.COMPILE_STATUS))throw gl.getShaderInfoLog(x);return x;};
   const prog=fs=>{const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,vs));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(p);return p;};
@@ -553,7 +561,7 @@ function makeComp(){try{
     gl.uniform2f(U(PB,'px'),1/W,1/H);gl.uniform1f(U(PB,'r'),Math.max(1.5,W/320));
     gl.uniform3f(U(PB,'tint'),bg.tint[0],bg.tint[1],bg.tint[2]);gl.uniform1f(U(PB,'dark'),bg.dark);
     gl.uniform1f(U(PB,'lo'),.42);gl.uniform1f(U(PB,'hi'),.68);gl.uniform1f(U(PB,'harm'),o.harm);gl.uniform1f(U(PB,'wrap'),o.wrap);
-    gl.uniform1f(U(PB,'grain'),.022);gl.uniform1f(U(PB,'seed'),Math.random()*100);draw(PB);
+    gl.uniform1f(U(PB,'grain'),.016);gl.uniform1f(U(PB,'seed'),Math.random()*100);draw(PB);
     return c;}};
 }catch(e){console.warn('compositeur',e);return null;}}
 // arrière-plan préparé : flou de profondeur + version douce (light-wrap) + teinte moyenne
@@ -712,8 +720,13 @@ function updateProFilter(){
 const GL=(()=>{try{
   const c=document.createElement('canvas'),gl=c.getContext('webgl',{premultipliedAlpha:false,antialias:false,preserveDrawingBuffer:true});if(!gl)return null;
   const vs='attribute vec2 p;varying vec2 uv;void main(){uv=p*.5+.5;gl_Position=vec4(p,0.,1.);}';
-  const fsBlend='precision mediump float;varying vec2 uv;uniform sampler2D cur,prev;uniform float a;void main(){gl_FragColor=vec4(mix(texture2D(prev,uv).rgb,texture2D(cur,uv).rgb,a),1.);}';
-  const fsMain=`precision mediump float;varying vec2 uv;uniform sampler2D t;uniform vec2 px;uniform mat3 M;uniform vec3 off;uniform float sharp,skin,rad;
+  const fsBlend='#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\nvarying vec2 uv;uniform sampler2D cur,prev;uniform float a;void main(){gl_FragColor=vec4(mix(texture2D(prev,uv).rgb,texture2D(cur,uv).rgb,a),1.);}';
+  const fsMain=`#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+varying vec2 uv;uniform sampler2D t;uniform vec2 px;uniform mat3 M;uniform vec3 off;uniform float sharp,skin,rad;
    vec3 T(vec2 o){return texture2D(t,uv+o*px).rgb;}
    void main(){vec3 c=T(vec2(0.));vec3 n=T(vec2(1.,0.))+T(vec2(-1.,0.))+T(vec2(0.,1.))+T(vec2(0.,-1.));
     vec3 b=(T(vec2(rad,0.))+T(vec2(-rad,0.))+T(vec2(0.,rad))+T(vec2(0.,-rad))+T(vec2(rad*.7,rad*.7))+T(vec2(-rad*.7,rad*.7))+T(vec2(rad*.7,-rad*.7))+T(vec2(-rad*.7,-rad*.7))+c*2.)/10.;
@@ -783,7 +796,7 @@ function outDims(){const [W,H]=FORMATS[FMT];const low=QUAL==='720'||(QUAL==='aut
 function perf(){const now=performance.now();if(lastF){ftimes.push(now-lastF);if(ftimes.length>60)ftimes.shift();}lastF=now;
   if(ftimes.length>=60&&(++fN)%30===0){const avg=ftimes.reduce((a,b)=>a+b,0)/ftimes.length,fps=Math.round(1000/avg);
     $('#fps').textContent=`⚡ ${fps} i/s · ${out.width}×${out.height}${GL?' · GPU':''}`;$('#fps').style.color=fps>=24?'#3CCB7F':'#E5484D';
-    if(QUAL==='auto'&&!lowRes&&!recording&&fps<22){lowRes=true;ftimes=[];toast('Mode fluide activé : enregistrement en 720p');}}}
+    if(QUAL==='auto'&&!lowRes&&!recording&&fps<17){lowRes=true;ftimes=[];toast('Mode fluide activé : enregistrement en 720p');}}}
 function schedule(){if(video.videoWidth&&video.requestVideoFrameCallback&&!video.paused)video.requestVideoFrameCallback(()=>frame());else requestAnimationFrame(frame);}
 function frame(){
   perf();
@@ -847,7 +860,7 @@ async function startRec(){
   await countdown();
   const stream=out.captureStream(30);
   if(micStream) micStream.getAudioTracks().forEach(t=>stream.addTrack(t));
-  chunks=[];rec=new MediaRecorder(stream,MIME?{mimeType:MIME,videoBitsPerSecond:8e6,audioBitsPerSecond:192e3}:{});
+  chunks=[];rec=new MediaRecorder(stream,MIME?{mimeType:MIME,videoBitsPerSecond:out.height*out.width>1.5e6?12e6:8e6,audioBitsPerSecond:192e3}:{});
   rec.ondataavailable=e=>e.data.size&&chunks.push(e.data);
   rec.onstop=()=>{const dur=(performance.now()-recStart)/1000;const blob=new Blob(chunks,{type:rec.mimeType||MIME||'video/webm'});addTake(blob,dur,recSubs.slice());};
   recSubs=[];recStart=performance.now();recording=true;rec.start(500);
@@ -891,6 +904,7 @@ function renderTakes(){
 // =====================================================================
 const edit=$('#edit'), ectx=edit.getContext('2d');
 const clips=[]; let subs=[]; let subStyle='box';
+function rack(v){v.muted=true;v.setAttribute('playsinline','');v.style.cssText='width:4px;height:4px';document.getElementById('vrack').appendChild(v);try{v.load();}catch(e){}return v;}
 function fixDuration(v){return new Promise(res=>{
   const done=()=>{v.removeEventListener('timeupdate',onT);res();};
   const onT=()=>{if(isFinite(v.duration)){v.currentTime=0;done();}};
@@ -898,7 +912,7 @@ function fixDuration(v){return new Promise(res=>{
   v.addEventListener('loadedmetadata',()=>{if(isFinite(v.duration))res();else{v.addEventListener('timeupdate',onT);v.currentTime=1e7;}},{once:true});
 });}
 async function addClip(url,dur,name,csubs=[],blob=null){
-  const v=document.createElement('video');v.src=url;v.preload='auto';v.playsInline=true;v.crossOrigin='anonymous';
+  const v=document.createElement('video');v.src=url;v.preload='auto';v.playsInline=true;rack(v);
   await fixDuration(v); const d=isFinite(v.duration)?v.duration:dur;
   const c={id:Math.random(),url,v,name,dur:d,in:0,out:d,subs:csubs,src:null};
   clips.push(c);renderClips();drawEditIdle();
@@ -1010,7 +1024,7 @@ function drawSub(ctx,W,H,text){
     else {ctx.fillStyle='#0B1B33';rr(ctx,W/2-tw/2-22*S,y-lh/2,tw+44*S,lh,14*S);ctx.fill();ctx.fillStyle='#F1D58E';ctx.fillText(l,W/2,y+2*S);}});
   ctx.restore();
 }
-function drawCover(ctx,v,W,H){const vw=v.videoWidth||W,vh=v.videoHeight||H,s=Math.max(W/vw,H/vh);ctx.drawImage(v,(W-vw*s)/2,(H-vh*s)/2,vw*s,vh*s);}
+function drawCover(ctx,v,W,H){if(v.readyState<2||!v.videoWidth)return;const vw=v.videoWidth||W,vh=v.videoHeight||H,s=Math.max(W/vw,H/vh);ctx.drawImage(v,(W-vw*s)/2,(H-vh*s)/2,vw*s,vh*s);}
 function drawEnd(ctx,W,H,k){const S=Math.min(W,H)/1080;ctx.fillStyle='#0B1B33';ctx.fillRect(0,0,W,H);
   const e=Math.min(1,k*2.5);drawLogo(ctx,W/2,H/2-120*S,(150+30*e)*S,e);
   ctx.globalAlpha=Math.min(1,Math.max(0,k*2.5-.6));ctx.fillStyle='#fff';ctx.textAlign='center';ctx.textBaseline='middle';ctx.font=`700 ${64*S}px Poppins`;ctx.fillText('Shenack Consulting',W/2,H/2+120*S);
@@ -1021,7 +1035,7 @@ function drawEditIdle(){const W=edit.width,H=edit.height;
   const c=clips[0];c.v.currentTime=c.in;const draw=()=>{drawClip(ectx,c.v,W,H);const s=subs.find(x=>x.start<=0.5&&x.end>0.5)||subs[0];if(s)drawSub(ectx,W,H,s.text);};c.v.onseeked=()=>{c.v.onseeked=null;draw();};setTimeout(draw,150);}
 
 // ---------- montage automatique ----------
-function newClipFrom(base,a,b,name){const v=document.createElement('video');v.src=base.url;v.preload='auto';v.playsInline=true;
+function newClipFrom(base,a,b,name){const v=document.createElement('video');v.src=base.url;v.preload='auto';v.playsInline=true;rack(v);
   return {id:Math.random(),url:base.url,v,name,dur:base.dur,in:a,out:b,subs:[],src:null};}
 async function speechSegments(c){
   const ab=await (await fetch(c.url)).arrayBuffer();const buf=await AC().decodeAudioData(ab);
@@ -1084,6 +1098,7 @@ async function ensureSeg2(){
 }
 function coverRect(v,W,H){const vw=v.videoWidth||W,vh=v.videoHeight||H,s=Math.max(W/vw,H/vh);return [(W-vw*s)/2,(H-vh*s)/2,vw*s,vh*s];}
 function drawClip(ctx,v,W,H){
+  if(v.readyState<2||!v.videoWidth)return;
   if(!EBG||!seg2){drawCover(ctx,v,W,H);return;}
   if(!seg2Busy&&v.videoWidth){seg2Busy=true;seg2.send({image:v}).catch(()=>{}).finally(()=>seg2Busy=false);}
   if(!maskEReady){drawCover(ctx,v,W,H);return;}
@@ -1148,7 +1163,10 @@ async function play(exportMode=false){
     rec=new MediaRecorder(st,MIME?{mimeType:MIME,videoBitsPerSecond:10e6,audioBitsPerSecond:192e3}:{});rec.ondataavailable=e=>e.data.size&&ch.push(e.data);
     $('#expProg').style.display='block';rec.start(500);}
   eng={i:0,off:0,msrc,rec,ch,exportMode,endStart:null,stopped:false};
-  const startClip=async i=>{const c=clips[i];c.v.currentTime=c.in;await new Promise(r=>{if(Math.abs(c.v.currentTime-c.in)<0.05&&c.v.readyState>=2)r();else c.v.addEventListener('seeked',r,{once:true});setTimeout(r,800);});await c.v.play().catch(()=>{});};
+  const startClip=async i=>{const c=clips[i];c.v.muted=false;c.v.currentTime=c.in;await new Promise(r=>{if(Math.abs(c.v.currentTime-c.in)<0.05&&c.v.readyState>=2)r();else c.v.addEventListener('seeked',r,{once:true});setTimeout(r,1500);});
+    try{await c.v.play();}catch(e){c.v.muted=true;try{await c.v.play();}catch(e2){}}
+    await new Promise(r=>{if(c.v.requestVideoFrameCallback){c.v.requestVideoFrameCallback(()=>r());setTimeout(r,2000);}else setTimeout(r,200);});
+    if(!c.v.videoWidth){$('#eStatus').innerHTML='⚠️ Ton téléphone n’arrive pas à lire l’image de cette vidéo (format HEVC / haute efficacité ?). Dans les réglages de l’appareil photo, désactive « Haute efficacité / HEVC » (choisis H.264), ou filme directement dans l’onglet Tournage.';}};
   await startClip(0);
   const fade=$('#fadeIO').checked, endCard=$('#endCard').checked;
   const loop=async()=>{if(!eng||eng.stopped)return;
@@ -1433,6 +1451,16 @@ window.addEventListener('beforeunload',()=>{if(window.__pendingUpdate&&window.st
 setTimeout(autoUpdate,2500);
 // PWA (téléphone / navigateur)
 if('serviceWorker' in navigator&&location.protocol==='https:'){navigator.serviceWorker.register('sw.js').catch(()=>{});}
+
+// ---------- téléphone : réglages adaptés + caméra avant/arrière ----------
+const PHONE=matchMedia('(pointer:coarse)').matches&&Math.min(screen.width,screen.height)<900;
+let facing='user';
+if(PHONE){$('#proSkin').value=10;$('#proNoise').value=15;$('#proSharp').value=50;$('#btnFlip').style.display='inline-block';}
+$('#btnFlip').onclick=async()=>{if(recording)return;facing=facing==='user'?'environment':'user';$('#mirror').checked=facing==='user';
+  try{const st=await navigator.mediaDevices.getUserMedia({video:{facingMode:{exact:facing},width:{ideal:1920},height:{ideal:1080}}});
+    if(camStream)camStream.getTracks().forEach(t=>t.stop());camStream=st;video.srcObject=st;await video.play();
+    const g=st.getVideoTracks()[0].getSettings();$('#camInfo').textContent=`Caméra ${facing==='user'?'avant':'arrière'} : ${g.width}×${g.height}`;toast(facing==='user'?'Caméra avant':'Caméra arrière : meilleure qualité d’image');listDevices();}
+  catch(e){toast('Impossible de changer de caméra');facing=facing==='user'?'environment':'user';}};
 
 // init
 listDevices();if(navigator.mediaDevices)navigator.mediaDevices.ondevicechange=listDevices;
