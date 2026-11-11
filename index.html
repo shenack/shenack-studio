@@ -142,9 +142,11 @@ a.dl{color:var(--gold2);font-weight:700}
       </div>
 
       <div class="card">
-        <h3>Décor (IA)</h3>
+        <h3>Décor</h3>
         <div class="bgs" id="bgs"></div>
-        <label class="btn sm" style="display:inline-block;margin-top:10px;cursor:pointer">🖼️ Importer mon décor<input type="file" id="bgFile" accept="image/*" hidden></label>
+        <label class="btn sm" style="display:inline-block;margin-top:10px;cursor:pointer">🖼️ Ajouter une photo de décor<input type="file" id="bgFile" accept="image/*" hidden></label>
+        <label>Profondeur de champ (flou du décor, comme une vraie caméra)</label><input type="range" id="dof" min="0" max="24" value="6">
+        <div class="chk"><input type="checkbox" id="showIllus"> Afficher aussi les décors illustrés</div>
         <div class="hint" id="segStatus" style="margin-top:8px">Le détourage IA se charge à l'activation de la caméra.</div>
       </div>
 
@@ -229,12 +231,20 @@ Aujourd'hui je vais vous montrer comment reprendre le contrôle de votre trésor
     </div>
     <div>
       <div class="card">
-        <h3>🖼️ Décor IA</h3>
-        <div class="hint" style="margin-bottom:8px">Décris le décor que tu veux derrière toi, puis clique sur Générer. L'IA te détoure dans tes prises et remplace le fond.</div>
-        <input type="text" id="decPrompt" placeholder="Ex. : bureau moderne vue sur Paris la nuit, église lumineuse, studio TV doré…">
+        <h3>🖼️ Décor photo réaliste</h3>
+        <div class="hint" style="margin-bottom:8px"><b>1.</b> Décris le décor voulu. <b>2.</b> Copie la demande et colle-la dans ChatGPT ou Gemini, qui créent une vraie photo. <b>3.</b> Importe la photo : le studio te place dedans, avec la lumière et le flou d'une vraie caméra.</div>
+        <input type="text" id="decPrompt" placeholder="Ex. : studio podcast moderne, bureau de cabinet financier avec vue sur Paris…">
         <div class="row" style="margin:8px 0;gap:6px;flex-wrap:wrap" id="decChips"></div>
-        <button class="btn gold sm" id="decGen" style="width:100%">✨ Générer 4 décors</button>
+        <button class="btn gold sm" id="decGen" style="width:100%">✨ Créer la demande pour l'IA d'images</button>
+        <textarea id="decOut" style="display:none;margin-top:8px;min-height:120px" readonly></textarea>
+        <div class="row" id="decActs" style="display:none;margin-top:6px;gap:6px">
+          <button class="btn sm" id="decCopy">📋 Copier la demande</button>
+          <a class="btn sm" href="https://chatgpt.com/" target="_blank" rel="noopener" style="text-decoration:none;text-align:center">Ouvrir ChatGPT</a>
+          <a class="btn sm" href="https://gemini.google.com/" target="_blank" rel="noopener" style="text-decoration:none;text-align:center">Ouvrir Gemini</a>
+        </div>
+        <label class="btn sm" style="display:block;text-align:center;margin-top:10px;cursor:pointer">📥 Importer la photo générée<input type="file" id="decFile" accept="image/*" hidden></label>
         <div class="bgs" id="decGrid" style="margin-top:10px"></div>
+        <label>Profondeur de champ (flou du décor)</label><input type="range" id="dof2" min="0" max="24" value="6">
         <div class="hint" id="decStatus" style="margin-top:6px"></div>
       </div>
       <div class="card">
@@ -311,7 +321,7 @@ Aujourd'hui je vais vous montrer comment reprendre le contrôle de votre trésor
 </div>
 
 <script type="module">
-const APP_VERSION='2.0';
+const APP_VERSION='2.1';
 // =====================================================================
 // Utilities
 // =====================================================================
@@ -451,6 +461,7 @@ let BG='none', customBg=null; const bgCache={};
 function rr(ctx,x,y,w,h,r){ctx.beginPath();ctx.roundRect?ctx.roundRect(x,y,w,h,r):ctx.rect(x,y,w,h);}
 function makeBg(id,W,H){
   const key=id+W+'x'+H; if(bgCache[key]) return bgCache[key];
+  if(id.startsWith('photo:')){const p=PHOTOS.find(x=>x.id===id);if(!p)return makeBg('navy',W,H);const c=photoCanvas(p,W,H);bgCache[key]=c;return c;}
   if(id.startsWith('gen')){const g=GEN.find(x=>x.id===id);const c=genDecor(g.spec,g.seed,W,H);bgCache[key]=c;return c;}
   const c=document.createElement('canvas');c.width=W;c.height=H;const x=c.getContext('2d');const S=Math.min(W,H)/1080;
   if(id==='cabinet'){
@@ -493,18 +504,99 @@ function makeBg(id,W,H){
   }
   bgCache[key]=c; return c;
 }
+// =====================================================================
+// Incrustation réaliste (GPU) : contours nets, lumière harmonisée, light-wrap, grain
+// =====================================================================
+function makeComp(){try{
+  const c=document.createElement('canvas'),gl=c.getContext('webgl',{premultipliedAlpha:false,antialias:false,preserveDrawingBuffer:true});if(!gl)return null;
+  const vs='attribute vec2 p;varying vec2 uv;void main(){uv=p*.5+.5;gl_Position=vec4(p,0.,1.);}';
+  const fsA='precision mediump float;varying vec2 uv;uniform sampler2D cur,prev;uniform float k;void main(){float m=texture2D(cur,uv).a;float o=texture2D(prev,uv).r;float v=mix(o,m,k);gl_FragColor=vec4(v,v,v,1.);}';
+  const fsB=`precision mediump float;varying vec2 uv;uniform sampler2D cam,msk,bg,bgs;uniform vec2 px;uniform vec3 tint;uniform float r,lo,hi,harm,wrap,grain,seed,dark;
+    float M(vec2 o){return texture2D(msk,uv+o*px*r).r;}
+    void main(){
+      float m=(M(vec2(0.))*4.+M(vec2(1.,0.))+M(vec2(-1.,0.))+M(vec2(0.,1.))+M(vec2(0.,-1.))+M(vec2(.7,.7))+M(vec2(-.7,.7))+M(vec2(.7,-.7))+M(vec2(-.7,-.7)))/12.;
+      float a=smoothstep(lo,hi,m);
+      vec3 p=texture2D(cam,uv).rgb,b=texture2D(bg,uv).rgb,s=texture2D(bgs,uv).rgb;
+      p=mix(p,p*tint,harm);
+      p*=mix(1.,dark,.6);
+      float w=clamp(a*(1.-a)*4.,0.,1.);
+      p=1.-(1.-p)*(1.-s*w*wrap);
+      vec3 o=mix(b,p,a);
+      float n=fract(sin(dot(uv*vec2(12.9898,78.233)+seed,vec2(1.,1.)))*43758.5453)-.5;
+      gl_FragColor=vec4(o+n*grain,1.);}`;
+  const sh=(t,src)=>{const x=gl.createShader(t);gl.shaderSource(x,src);gl.compileShader(x);if(!gl.getShaderParameter(x,gl.COMPILE_STATUS))throw gl.getShaderInfoLog(x);return x;};
+  const prog=fs=>{const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,vs));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(p);return p;};
+  const PA=prog(fsA),PB=prog(fsB);
+  const buf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buf);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+  const tex=()=>{const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);[gl.TEXTURE_MIN_FILTER,gl.TEXTURE_MAG_FILTER].forEach(k=>gl.texParameteri(gl.TEXTURE_2D,k,gl.LINEAR));gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);return t;};
+  const tCam=tex(),tMask=tex(),tBg=tex(),tBgs=tex();let fb=[],W=0,H=0,idx=0,init=false,bgKey=null;
+  const up=(t,src)=>{gl.bindTexture(gl.TEXTURE_2D,t);gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,src);};
+  const draw=p=>{const l=gl.getAttribLocation(p,'p');gl.bindBuffer(gl.ARRAY_BUFFER,buf);gl.enableVertexAttribArray(l);gl.vertexAttribPointer(l,2,gl.FLOAT,false,0,0);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);};
+  const U=(p,n)=>gl.getUniformLocation(p,n);
+  return {canvas:c,reset(){init=false;},run(cam,mask,bg,o){
+    const w=cam.width,h=cam.height;
+    if(c.width!==w||c.height!==h){c.width=w;c.height=h;W=w;H=h;fb=[0,1].map(()=>{const t=tex();gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);const f=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,f);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);return {t,f};});init=false;bgKey=null;}
+    gl.viewport(0,0,W,H);
+    gl.activeTexture(gl.TEXTURE0);up(tCam,cam);gl.activeTexture(gl.TEXTURE1);up(tMask,mask);
+    if(bg.key!==bgKey||bg.live){gl.activeTexture(gl.TEXTURE2);up(tBg,bg.c);gl.activeTexture(gl.TEXTURE3);up(tBgs,bg.soft);bgKey=bg.key;}
+    // A: lissage temporel du masque
+    const prev=fb[idx],next=fb[1-idx];gl.useProgram(PA);gl.bindFramebuffer(gl.FRAMEBUFFER,next.f);
+    gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,tMask);gl.uniform1i(U(PA,'cur'),1);
+    gl.activeTexture(gl.TEXTURE4);gl.bindTexture(gl.TEXTURE_2D,prev.t);gl.uniform1i(U(PA,'prev'),4);
+    gl.uniform1f(U(PA,'k'),init?.6:1.);draw(PA);init=true;idx=1-idx;
+    // B: composition
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.useProgram(PB);
+    gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,tCam);gl.uniform1i(U(PB,'cam'),0);
+    gl.activeTexture(gl.TEXTURE5);gl.bindTexture(gl.TEXTURE_2D,next.t);gl.uniform1i(U(PB,'msk'),5);
+    gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,tBg);gl.uniform1i(U(PB,'bg'),2);
+    gl.activeTexture(gl.TEXTURE3);gl.bindTexture(gl.TEXTURE_2D,tBgs);gl.uniform1i(U(PB,'bgs'),3);
+    gl.uniform2f(U(PB,'px'),1/W,1/H);gl.uniform1f(U(PB,'r'),Math.max(1.5,W/320));
+    gl.uniform3f(U(PB,'tint'),bg.tint[0],bg.tint[1],bg.tint[2]);gl.uniform1f(U(PB,'dark'),bg.dark);
+    gl.uniform1f(U(PB,'lo'),.42);gl.uniform1f(U(PB,'hi'),.68);gl.uniform1f(U(PB,'harm'),o.harm);gl.uniform1f(U(PB,'wrap'),o.wrap);
+    gl.uniform1f(U(PB,'grain'),.022);gl.uniform1f(U(PB,'seed'),Math.random()*100);draw(PB);
+    return c;}};
+}catch(e){console.warn('compositeur',e);return null;}}
+// arrière-plan préparé : flou de profondeur + version douce (light-wrap) + teinte moyenne
+const bgPrep={};
+function prepBg(src,key,W,H,live=false){
+  const dof=+(document.getElementById('dof')?.value||6),S=Math.min(W,H)/1080,k=key+'|'+W+'x'+H+'|'+dof;
+  if(!live&&bgPrep[k])return bgPrep[k];
+  const P=bgPrep[k]||(bgPrep[k]={c:document.createElement('canvas'),soft:document.createElement('canvas')});
+  P.c.width=W;P.c.height=H;const x=P.c.getContext('2d');x.filter=dof>0?`blur(${dof*S}px)`:'none';const m=dof*S*2;x.drawImage(src,-m,-m,W+2*m,H+2*m);x.filter='none';
+  P.soft.width=Math.max(8,Math.round(W/16));P.soft.height=Math.max(8,Math.round(H/16));const sx=P.soft.getContext('2d');sx.filter='blur(3px)';sx.drawImage(P.c,0,0,P.soft.width,P.soft.height);sx.filter='none';
+  if(!live||!P.tint){const t=document.createElement('canvas');t.width=t.height=1;const tx=t.getContext('2d',{willReadFrequently:true});tx.drawImage(P.c,0,0,1,1);const d=tx.getImageData(0,0,1,1).data;
+    const r=d[0]/255,g=d[1]/255,b=d[2]/255,l=Math.max(.05,.299*r+.587*g+.114*b),cl=v=>Math.min(1.3,Math.max(.75,v));
+    P.tint=[cl(r/l),cl(g/l),cl(b/l)];P.dark=Math.min(1,Math.max(.7,.55+l));}
+  P.key=k;P.live=live;return P;
+}
+// ---------- bibliothèque de décors photo (enregistrés sur l'appareil) ----------
+const PHOTOS=[];
+function idb(){return new Promise((res,rej)=>{const r=indexedDB.open('shenack-studio',1);r.onupgradeneeded=()=>r.result.createObjectStore('decors',{keyPath:'id'});r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});}
+async function idbAll(){try{const db=await idb();return await new Promise(res=>{const q=db.transaction('decors').objectStore('decors').getAll();q.onsuccess=()=>res(q.result||[]);q.onerror=()=>res([]);});}catch(e){return [];}}
+async function idbPut(o){try{const db=await idb();await new Promise(res=>{const t=db.transaction('decors','readwrite');t.objectStore('decors').put(o);t.oncomplete=res;t.onerror=res;});}catch(e){}}
+async function idbDel(id){try{const db=await idb();await new Promise(res=>{const t=db.transaction('decors','readwrite');t.objectStore('decors').delete(id);t.oncomplete=res;t.onerror=res;});}catch(e){}}
+function loadImg(blob){return new Promise((res,rej)=>{const im=new Image();im.onload=()=>res(im);im.onerror=rej;im.src=URL.createObjectURL(blob);});}
+async function addPhoto(blob,name,save=true){const id='photo:'+Date.now()+Math.floor(Math.random()*1e4);const img=await loadImg(blob);const p={id,name:name||'Mon décor',img};PHOTOS.push(p);if(save)await idbPut({id,name:p.name,blob});return p;}
+async function initPhotos(){const all=await idbAll();for(const o of all){try{PHOTOS.push({id:o.id,name:o.name,img:await loadImg(o.blob)});}catch(e){}}renderBgButtons();if(typeof renderDecGrid==='function')renderDecGrid();}
+function photoCanvas(p,W,H){const c=document.createElement('canvas');c.width=W;c.height=H;const x=c.getContext('2d'),im=p.img,s=Math.max(W/im.width,H/im.height);x.drawImage(im,(W-im.width*s)/2,(H-im.height*s)/2,im.width*s,im.height*s);return c;}
+
 function renderBgButtons(){
-  const box=$('#bgs');box.innerHTML='';
-  BG_DEFS.forEach(d=>{const b=document.createElement('button');b.textContent=d.name;b.dataset.id=d.id;
-    if(d.id==='none') b.style.background='#000 linear-gradient(135deg,#333,#111)';
-    else if(d.id==='blur') b.style.background='linear-gradient(135deg,#6a7a90,#2d3a4d)';
-    else b.style.backgroundImage=`url(${makeBg(d.id,180,240).toDataURL()})`;
-    b.classList.toggle('on',d.id===BG);b.onclick=()=>{BG=d.id;renderBgButtons();ensureSeg();};box.appendChild(b);});
-  GEN.forEach(d=>{const b=document.createElement('button');b.textContent=d.name;b.style.backgroundImage=`url(${makeBg(d.id,180,240).toDataURL()})`;b.classList.toggle('on',BG===d.id);b.onclick=()=>{BG=d.id;renderBgButtons();ensureSeg();};box.appendChild(b);});
-  if(customBg){const b=document.createElement('button');b.textContent='Mon décor';b.style.backgroundImage=`url(${customBg.src})`;b.classList.toggle('on',BG==='custom');b.onclick=()=>{BG='custom';renderBgButtons();ensureSeg();};box.appendChild(b);}
+  const box=$('#bgs');box.innerHTML='';const illus=$('#showIllus')&&$('#showIllus').checked;
+  const add=(id,name,style,del)=>{const b=document.createElement('button');b.textContent=name;b.dataset.id=id;Object.assign(b.style,style);b.classList.toggle('on',id===BG);
+    b.onclick=()=>{BG=id;renderBgButtons();ensureSeg();};
+    if(del){const x=document.createElement('span');x.textContent='✕';x.title='Supprimer';x.style.cssText='position:absolute;top:3px;right:6px;font-size:12px;background:rgba(0,0,0,.6);border-radius:50%;width:18px;height:18px;display:grid;place-items:center';b.style.position='relative';
+      x.onclick=async e=>{e.stopPropagation();const i=PHOTOS.findIndex(p=>p.id===id);if(i>=0)PHOTOS.splice(i,1);await idbDel(id);if(BG===id)BG='blur';renderBgButtons();if(typeof renderDecGrid==='function')renderDecGrid();};b.appendChild(x);}
+    box.appendChild(b);};
+  add('none','Aucun',{background:'#000 linear-gradient(135deg,#333,#111)'});
+  add('blur','Flou',{background:'linear-gradient(135deg,#6a7a90,#2d3a4d)'});
+  PHOTOS.forEach(p=>add(p.id,p.name,{backgroundImage:`url(${p.img.src})`,backgroundSize:'cover',backgroundPosition:'center'},true));
+  if(illus){BG_DEFS.filter(d=>!['none','blur'].includes(d.id)).forEach(d=>add(d.id,d.name,{backgroundImage:`url(${makeBg(d.id,180,240).toDataURL()})`}));
+    GEN.forEach(d=>add(d.id,d.name,{backgroundImage:`url(${makeBg(d.id,180,240).toDataURL()})`}));}
+  if(!PHOTOS.length){const h=document.createElement('div');h.className='hint';h.style.gridColumn='1/-1';h.innerHTML='Ajoute une <b>photo de décor</b> (studio, bureau…) avec le bouton ci-dessous, ou crée-la avec l’IA depuis l’onglet Montage › Décor photo.';box.appendChild(h);}
 }
 renderBgButtons();
-$('#bgFile').onchange=e=>{const f=e.target.files[0];if(!f)return;const im=new Image();im.onload=()=>{customBg=im;BG='custom';renderBgButtons();ensureSeg();};im.src=URL.createObjectURL(f);};
+$('#bgFile').onchange=async e=>{const f=e.target.files[0];if(!f)return;e.target.value='';const p=await addPhoto(f,f.name.replace(/\.[^.]+$/,'').slice(0,18));BG=p.id;renderBgButtons();if(typeof renderDecGrid==='function')renderDecGrid();ensureSeg();toast('Décor enregistré : il sera disponible à chaque ouverture');};
+$('#showIllus').onchange=renderBgButtons;
 
 // =====================================================================
 // Camera + segmentation
@@ -513,6 +605,8 @@ const video=document.createElement('video');video.playsInline=true;video.muted=t
 let camStream=null, micStream=null, seg=null, segLoading=false;
 const out=$('#out'), octx=out.getContext('2d');
 const person=document.createElement('canvas'), pctx=person.getContext('2d');
+const camO=document.createElement('canvas'),camOX=camO.getContext('2d'),mskO=document.createElement('canvas'),mskOX=mskO.getContext('2d');
+let COMP1=null,COMP2=null;setTimeout(()=>{COMP1=makeComp();COMP2=makeComp();},0);
 const blurC=document.createElement('canvas'), blurX=blurC.getContext('2d');
 const maskC=document.createElement('canvas'), mctx=maskC.getContext('2d');
 let maskReady=false;
@@ -567,9 +661,9 @@ async function ensureSeg(){
     try{
       if(!window.SelfieSegmentation) await loadScript(base+'selfie_segmentation.js');
       const s=new window.SelfieSegmentation({locateFile:f=>base+f});
-      s.setOptions({modelSelection:1,selfieMode:false});
+      s.setOptions({modelSelection:0,selfieMode:false});
       s.onResults(r=>{const m=r.segmentationMask;if(!m)return;if(maskC.width!==m.width||maskC.height!==m.height){maskC.width=m.width;maskC.height=m.height;}
-        mctx.globalCompositeOperation='copy';mctx.filter='blur(4px)';mctx.drawImage(m,0,0);mctx.filter='none';mctx.globalCompositeOperation='source-over';maskReady=true;});
+        mctx.globalCompositeOperation='copy';mctx.filter='blur(1px)';mctx.drawImage(m,0,0);mctx.filter='none';mctx.globalCompositeOperation='source-over';maskReady=true;});
       await s.initialize();
       seg=s;$('#segStatus').textContent='✅ Détourage IA prêt. Conseil : lumière de face, fond le plus uni possible derrière toi.';break;
     }catch(e){console.warn('seg',base,e);}
@@ -701,7 +795,16 @@ function frame(){
   if(useSeg) runSeg();
   const PRO=$('#proOn').checked, src=PRO?processFrame():video, cf=PRO?'none':camFilter();
   const tr=c=>{if(mir){c.translate(W,0);c.scale(-1,1);}};
-  if(useSeg&&maskReady){
+  if(useSeg&&maskReady&&COMP1){
+    if(camO.width!==W||camO.height!==H){camO.width=W;camO.height=H;mskO.width=W;mskO.height=H;}
+    camOX.save();camOX.setTransform(1,0,0,1,0,0);camOX.clearRect(0,0,W,H);tr(camOX);camOX.filter=cf;camOX.drawImage(src,rx,ry,rw,rh);camOX.restore();
+    mskOX.save();mskOX.setTransform(1,0,0,1,0,0);mskOX.clearRect(0,0,W,H);tr(mskOX);mskOX.imageSmoothingQuality='high';mskOX.drawImage(maskC,rx,ry,rw,rh);mskOX.restore();
+    let bg;
+    if(BG==='blur'){const bw=Math.round(W/8),bh=Math.round(H/8);if(blurC.width!==bw||blurC.height!==bh){blurC.width=bw;blurC.height=bh;}
+      blurX.save();blurX.setTransform(1,0,0,1,0,0);blurX.filter='blur(3px)';blurX.drawImage(camO,0,0,bw,bh);blurX.restore();bg=prepBg(blurC,'live-blur',W,H,true);}
+    else bg=prepBg(makeBg(BG,W,H),BG,W,H);
+    octx.drawImage(COMP1.run(camO,mskO,bg,{harm:.22,wrap:.55}),0,0);
+  } else if(useSeg&&maskReady){
     // background
     if(BG==='blur'){const bw=Math.round(W/8),bh=Math.round(H/8);if(blurC.width!==bw||blurC.height!==bh){blurC.width=bw;blurC.height=bh;}
       blurX.save();blurX.setTransform(1,0,0,1,0,0);if(mir){blurX.translate(bw,0);blurX.scale(-1,1);}blurX.filter=`blur(3px)${cf==='none'?'':' '+cf}`;blurX.drawImage(src,rx/8-5,ry/8-5,rw/8+10,rh/8+10);blurX.restore();
@@ -969,13 +1072,13 @@ $('#btnAuto').onclick=autoMontage;
 
 // ---------- décor IA dans le montage ----------
 let EBG=null,seg2=null,seg2Busy=false,maskEReady=false;const maskE=document.createElement('canvas'),meX=maskE.getContext('2d');
-const eP=document.createElement('canvas'),ePX=eP.getContext('2d');
+const eP=document.createElement('canvas'),ePX=eP.getContext('2d'),eM=document.createElement('canvas'),eMX=eM.getContext('2d');
 async function ensureSeg2(){
   if(seg2) return seg2;
   const bases=location.protocol==='file:'?['https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1.1675465747/']:['mp/','https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1.1675465747/'];
   for(const base of bases){try{if(!window.SelfieSegmentation)await loadScript(base+'selfie_segmentation.js');
-    const x=new window.SelfieSegmentation({locateFile:f=>base+f});x.setOptions({modelSelection:1,selfieMode:false});
-    x.onResults(r=>{const m=r.segmentationMask;if(!m)return;if(maskE.width!==m.width||maskE.height!==m.height){maskE.width=m.width;maskE.height=m.height;}meX.globalCompositeOperation='copy';meX.filter='blur(4px)';meX.drawImage(m,0,0);meX.filter='none';meX.globalCompositeOperation='source-over';maskEReady=true;});
+    const x=new window.SelfieSegmentation({locateFile:f=>base+f});x.setOptions({modelSelection:0,selfieMode:false});
+    x.onResults(r=>{const m=r.segmentationMask;if(!m)return;if(maskE.width!==m.width||maskE.height!==m.height){maskE.width=m.width;maskE.height=m.height;}meX.globalCompositeOperation='copy';meX.filter='blur(1px)';meX.drawImage(m,0,0);meX.filter='none';meX.globalCompositeOperation='source-over';maskEReady=true;});
     await x.initialize();seg2=x;return x;}catch(e){console.warn(e);}}
   return null;
 }
@@ -984,26 +1087,40 @@ function drawClip(ctx,v,W,H){
   if(!EBG||!seg2){drawCover(ctx,v,W,H);return;}
   if(!seg2Busy&&v.videoWidth){seg2Busy=true;seg2.send({image:v}).catch(()=>{}).finally(()=>seg2Busy=false);}
   if(!maskEReady){drawCover(ctx,v,W,H);return;}
+  const [x,y,w,h]=coverRect(v,W,H);
+  if(COMP2){if(eP.width!==W||eP.height!==H){eP.width=W;eP.height=H;eM.width=W;eM.height=H;}
+    ePX.clearRect(0,0,W,H);ePX.drawImage(v,x,y,w,h);eMX.clearRect(0,0,W,H);eMX.imageSmoothingQuality='high';eMX.drawImage(maskE,x,y,w,h);
+    ctx.drawImage(COMP2.run(eP,eM,prepBg(makeBg(EBG,W,H),EBG,W,H),{harm:.22,wrap:.55}),0,0);return;}
   ctx.drawImage(makeBg(EBG,W,H),0,0,W,H);
   if(eP.width!==W||eP.height!==H){eP.width=W;eP.height=H;}
-  const [x,y,w,h]=coverRect(v,W,H);ePX.clearRect(0,0,W,H);ePX.drawImage(v,x,y,w,h);ePX.save();ePX.globalCompositeOperation='destination-in';ePX.drawImage(maskE,x,y,w,h);ePX.restore();
+  ePX.clearRect(0,0,W,H);ePX.drawImage(v,x,y,w,h);ePX.save();ePX.globalCompositeOperation='destination-in';ePX.drawImage(maskE,x,y,w,h);ePX.restore();
   ctx.drawImage(eP,0,0);
 }
-const DEC_CHIPS=['Bureau moderne','Église lumineuse','Salon cosy','Ville de nuit','Bibliothèque','Plage','Nature','Studio TV doré','Espace','Dégradé bleu nuit'];
+const DEC_CHIPS=['Studio podcast moderne','Bureau de cabinet financier','Plateau TV','Bureau avec vue sur Paris','Scène d’église lumineuse','Salon moderne et chaleureux','Bibliothèque élégante'];
 DEC_CHIPS.forEach(t=>{const b=document.createElement('button');b.className='btn sm';b.textContent=t;b.style.flex='0 0 auto';b.onclick=()=>{$('#decPrompt').value=t;genDecors();};$('#decChips').appendChild(b);});
 function renderDecGrid(){const g=$('#decGrid');g.innerHTML='';
-  const none=document.createElement('button');none.textContent="Décor d'origine";none.style.background='linear-gradient(135deg,#333,#111)';none.classList.toggle('on',!EBG);none.onclick=()=>{EBG=null;renderDecGrid();drawEditIdle();};g.appendChild(none);
-  GEN.slice(-11).reverse().forEach(d=>{const b=document.createElement('button');b.textContent=d.name;b.style.backgroundImage=`url(${makeBg(d.id,180,240).toDataURL()})`;b.classList.toggle('on',EBG===d.id);
-    b.onclick=async()=>{EBG=d.id;renderDecGrid();$('#decStatus').textContent='⏳ Chargement du détourage IA…';const ok=await ensureSeg2();$('#decStatus').textContent=ok?'✅ Décor appliqué à tout le montage. Lance l’aperçu pour voir le résultat.':'⚠️ Détourage indisponible (connexion internet nécessaire la première fois).';previewDecor();};g.appendChild(b);});}
+  const add=(id,name,style)=>{const b=document.createElement('button');b.textContent=name;Object.assign(b.style,style);b.classList.toggle('on',(EBG||null)===id);
+    b.onclick=async()=>{EBG=id;renderDecGrid();if(!id){drawEditIdle();return;}$('#decStatus').textContent='⏳ Chargement du détourage IA…';const ok=await ensureSeg2();$('#decStatus').textContent=ok?'✅ Décor appliqué à tout le montage. Lance l’aperçu pour voir le résultat.':'⚠️ Détourage indisponible (connexion internet nécessaire la première fois).';previewDecor();};g.appendChild(b);};
+  add(null,"Décor d'origine",{background:'linear-gradient(135deg,#333,#111)'});
+  PHOTOS.forEach(p=>add(p.id,p.name,{backgroundImage:`url(${p.img.src})`,backgroundSize:'cover',backgroundPosition:'center'}));
+  if(!PHOTOS.length){const h=document.createElement('div');h.className='hint';h.style.gridColumn='2/-1';h.textContent='Tes décors photo apparaîtront ici.';g.appendChild(h);}
+}
 async function previewDecor(){if(!clips.length||!seg2)return;const c=clips[0],W=edit.width,H=edit.height;c.v.currentTime=c.in+0.1;await new Promise(r=>{c.v.addEventListener('seeked',r,{once:true});setTimeout(r,700);});
-  maskEReady=false;try{await seg2.send({image:c.v});}catch(e){}drawClip(ectx,c.v,W,H);const sb=subs.find(x=>x.start<=0.5&&x.end>0.5);if(sb)drawSub(ectx,W,H,sb.text);}
-let genN=0;
-function genDecors(){const txt=$('#decPrompt').value.trim()||DEC_CHIPS[Math.floor(Math.random()*DEC_CHIPS.length)];const spec=parseDecor(txt);
-  for(let i=0;i<4;i++){genN++;GEN.push({id:'gen'+genN,spec,seed:Math.floor(Math.random()*2e9)+5,name:(txt.length>18?txt.slice(0,17)+'…':txt)+' '+(i+1)});}
-  renderDecGrid();renderBgButtons();
-  $('#decStatus').textContent=spec.theme==='abstrait'?'Je n’ai pas reconnu de lieu précis : voici des décors graphiques. Essaie par ex. « bureau », « église », « ville de nuit »… Clique sur un décor pour l’appliquer.':'Clique sur un décor pour l’appliquer à ta vidéo. Reclique sur Générer pour d’autres versions.';}
+  maskEReady=false;if(COMP2)COMP2.reset();for(let i=0;i<3;i++){try{await seg2.send({image:c.v});}catch(e){}drawClip(ectx,c.v,W,H);}const sb=subs.find(x=>x.start<=0.5&&x.end>0.5);if(sb)drawSub(ectx,W,H,sb.text);}
+function genDecors(){
+  const txt=$('#decPrompt').value.trim()||DEC_CHIPS[0];const vert=FMT==='9:16',sq=FMT==='1:1';
+  const prompt=`Photo ultra réaliste d’un ${txt}, vide, sans aucune personne, prise à hauteur des yeux d’une personne assise, comme l’arrière-plan d’une vidéo YouTube professionnelle. Format ${vert?'vertical 9:16 (1080×1920)':sq?'carré 1:1':'horizontal 16:9 (1920×1080)'}. Faible profondeur de champ : l’arrière-plan est légèrement flou avec un joli bokeh. Éclairage de studio doux et professionnel, lumières chaudes en arrière-plan. Ambiance premium et élégante, touches de bleu marine et de doré. Le centre de l’image doit rester dégagé (la personne sera placée au milieu, au premier plan). Aucun texte, aucun logo. Qualité photo 4K, rendu naturel comme une vraie photo d’appareil photo.`;
+  $('#decOut').value=prompt;$('#decOut').style.display='block';$('#decActs').style.display='flex';
+  $('#decStatus').textContent='Copie la demande, colle-la dans ChatGPT ou Gemini, télécharge l’image obtenue puis clique sur « Importer la photo générée ».';
+}
 $('#decGen').onclick=genDecors;$('#decPrompt').addEventListener('keydown',e=>{if(e.key==='Enter')genDecors();});
+$('#decCopy').onclick=async()=>{try{await navigator.clipboard.writeText($('#decOut').value);toast('Demande copiée : colle-la dans ChatGPT ou Gemini');}catch(e){$('#decOut').select();toast('Sélectionne le texte et copie-le (Ctrl+C)');}};
+$('#decFile').onchange=async e=>{const f=e.target.files[0];if(!f)return;e.target.value='';const name=($('#decPrompt').value.trim()||'Décor photo').slice(0,18);const p=await addPhoto(f,name);renderBgButtons();EBG=p.id;renderDecGrid();
+  $('#decStatus').textContent='⏳ Application du décor…';const ok=await ensureSeg2();$('#decStatus').textContent=ok?'✅ Décor enregistré et appliqué. Il est aussi disponible dans Tournage.':'⚠️ Détourage indisponible.';previewDecor();};
+const syncDof=(from,to)=>{$(to).value=$(from).value;if(eng)return;if(EBG)previewDecor();};
+$('#dof2').addEventListener('change',()=>syncDof('#dof2','#dof'));$('#dof').addEventListener('change',()=>{$('#dof2').value=$('#dof').value;});
 renderDecGrid();
+initPhotos();
 
 // ---------- playback / export engine ----------
 let eng=null;
