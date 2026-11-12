@@ -353,7 +353,7 @@ Aujourd'hui je vais vous montrer comment reprendre le contrôle de votre trésor
 </div>
 
 <script type="module">
-const APP_VERSION='2.8';
+const APP_VERSION='2.9';
 // =====================================================================
 // Utilities
 // =====================================================================
@@ -361,7 +361,8 @@ const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
 const fmtT=s=>{s=Math.max(0,s||0);const m=Math.floor(s/60),x=Math.floor(s%60);return String(m).padStart(2,'0')+':'+String(x).padStart(2,'0');};
 function toast(m){const t=$('#toast');t.textContent=m;t.style.display='block';clearTimeout(toast._t);toast._t=setTimeout(()=>t.style.display='none',2600);}
 function dl(blob,name){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();setTimeout(()=>a.remove(),500);}
-$$('nav button').forEach(b=>b.onclick=()=>{$$('nav button').forEach(x=>x.classList.toggle('on',x===b));$$('.tab').forEach(t=>t.classList.toggle('on',t.id==='tab-'+b.dataset.tab));});
+let TAB='tournage';
+$$('nav button').forEach(b=>b.onclick=()=>{TAB=b.dataset.tab;$$('nav button').forEach(x=>x.classList.toggle('on',x===b));$$('.tab').forEach(t=>t.classList.toggle('on',t.id==='tab-'+b.dataset.tab));});
 let audioCtx=null; const AC=()=>audioCtx||(audioCtx=new (window.AudioContext||window.webkitAudioContext)());
 const FORMATS={'9:16':[1080,1920],'16:9':[1920,1080],'1:1':[1080,1080]};
 let FMT='9:16';
@@ -833,6 +834,7 @@ function perf(){const now=performance.now();if(lastF){ftimes.push(now-lastF);if(
 function schedule(){if(video.videoWidth&&video.requestVideoFrameCallback&&!video.paused)video.requestVideoFrameCallback(()=>frame());else requestAnimationFrame(frame);}
 let switching=false;
 function frame(){
+  if(TAB!=='tournage'&&!recording){lastF=0;ftimes=[];setTimeout(frame,400);return;}
   if(switching){if(recording)$('#timer').textContent=fmtT((performance.now()-recStart)/1000);requestAnimationFrame(frame);return;}
   perf();
   const [W,H]=recording?[out.width,out.height]:outDims(); if(out.width!==W||out.height!==H){out.width=W;out.height=H;}if(person.width!==W||person.height!==H){person.width=W;person.height=H;}
@@ -988,22 +990,47 @@ renderSubs();
 let curT=0;
 $('#subAdd').onclick=()=>{subs.push({start:curT,end:curT+2.5,text:'Ton texte ici'});renderSubs();};
 // ---------- sous-titres automatiques (IA Whisper, sur l'ordinateur) ----------
-let asr=null,asrModel='',ASRQ='small';
+const MOBILE=/Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+let asr=null,asrModel='',ASRQ=MOBILE?'base':'small';
+if(MOBILE)document.querySelectorAll('#asrQ button').forEach(b=>b.classList.toggle('on',b.dataset.q==='base'));
 const ASR_MODELS={base:['Xenova/whisper-base','≈ 80 Mo'],small:['Xenova/whisper-small','≈ 250 Mo'],turbo:['onnx-community/whisper-large-v3-turbo','≈ 600 Mo']};
 $$('#asrQ button').forEach(b=>b.onclick=()=>{ASRQ=b.dataset.q;$$('#asrQ button').forEach(x=>x.classList.toggle('on',x===b));});
 try{const w=localStorage.getItem('asrWords');if(w)$('#asrWords').value=w;}catch(e){}
 $('#asrWords').addEventListener('change',()=>{try{localStorage.setItem('asrWords',$('#asrWords').value);}catch(e){}});
+const ASR_WCODE=`let T,asr;
+self.onmessage=async e=>{const m=e.data;try{
+  if(m.cmd==='load'){T=T||await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1');T.env.allowLocalModels=false;
+    const prog=p=>{if(p.status==='progress'&&p.total)self.postMessage({type:'prog',file:p.file,loaded:p.loaded,total:p.total});};
+    try{asr=await T.pipeline('automatic-speech-recognition',m.id,m.gpu?{device:'webgpu',dtype:{encoder_model:'fp16',decoder_model_merged:'q4'},progress_callback:prog}:{dtype:'q8',device:'wasm',progress_callback:prog});}
+    catch(err){asr=await T.pipeline('automatic-speech-recognition',m.id,{dtype:'q8',device:'wasm',progress_callback:prog});}
+    self.postMessage({type:'done',rid:m.rid});}
+  else if(m.cmd==='run'){const r=await asr(m.audio,m.opts);self.postMessage({type:'done',rid:m.rid,result:{text:r.text,chunks:(r.chunks||[]).map(c=>({text:c.text,timestamp:c.timestamp}))}});}
+}catch(err){self.postMessage({type:'err',rid:m.rid,msg:String(err&&err.message||err)});}};`;
+let asrW=null,asrRid=0;const asrCb={};let asrProg=null;
+function asrCall(msg,transfer){return new Promise((res,rej)=>{const rid=++asrRid;asrCb[rid]=[res,rej];asrW.postMessage({...msg,rid},transfer||[]);});}
 async function getASR(st){
   const [id,size]=ASR_MODELS[ASRQ];
   if(asr&&asrModel===id) return asr;
   st(`⏳ Chargement de l’IA de transcription… (la première fois, téléchargement ${size}, ensuite c’est instantané)`);
+  const files={};
+  const prog=p=>{files[p.file]=[p.loaded,p.total];const L=Object.values(files).reduce((a,x)=>a+x[0],0),Tt=Object.values(files).reduce((a,x)=>a+x[1],0);st(`⏳ Téléchargement de l’IA de transcription : ${Math.round(L/Tt*100)} % (une seule fois)`);};
+  const gpu=!!navigator.gpu&&ASRQ!=='base'&&!MOBILE;
+  // 1) en arrière-plan (Web Worker) : la page reste fluide pendant la transcription
+  try{
+    if(asrW){asrW.terminate();asrW=null;}
+    asrW=new Worker(URL.createObjectURL(new Blob([ASR_WCODE],{type:'text/javascript'})),{type:'module'});
+    asrW.onmessage=e=>{const m=e.data;if(m.type==='prog'){prog(m);return;}const cb=asrCb[m.rid];if(!cb)return;delete asrCb[m.rid];m.type==='err'?cb[1](new Error(m.msg)):cb[0](m.result);};
+    asrW.onerror=e=>{Object.keys(asrCb).forEach(k=>{asrCb[k][1](new Error(e.message||'worker'));delete asrCb[k];});};
+    await asrCall({cmd:'load',id,gpu});
+    asr=(audio,opts)=>{const a=new Float32Array(audio);return asrCall({cmd:'run',audio:a,opts},[a.buffer]);};
+    asrModel=id;return asr;
+  }catch(e){console.warn('Worker IA indisponible, transcription sur la page',e);if(asrW){asrW.terminate();asrW=null;}}
+  // 2) secours : sur la page
   const T=await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1');
   T.env.allowLocalModels=false;
-  const files={};
-  const prog=p=>{if(p.status==='progress'&&p.total){files[p.file]=[p.loaded,p.total];const L=Object.values(files).reduce((a,x)=>a+x[0],0),Tt=Object.values(files).reduce((a,x)=>a+x[1],0);st(`⏳ Téléchargement de l’IA de transcription : ${Math.round(L/Tt*100)} % (une seule fois)`);}};
-  const gpu=!!navigator.gpu&&ASRQ!=='base';
-  try{asr=await T.pipeline('automatic-speech-recognition',id,gpu?{device:'webgpu',dtype:{encoder_model:'fp16',decoder_model_merged:'q4'},progress_callback:prog}:{dtype:'q8',device:'wasm',progress_callback:prog});}
-  catch(e){asr=await T.pipeline('automatic-speech-recognition',id,{dtype:'q8',device:'wasm',progress_callback:prog});}
+  const p2=p=>{if(p.status==='progress'&&p.total)prog(p);};
+  try{asr=await T.pipeline('automatic-speech-recognition',id,gpu?{device:'webgpu',dtype:{encoder_model:'fp16',decoder_model_merged:'q4'},progress_callback:p2}:{dtype:'q8',device:'wasm',progress_callback:p2});}
+  catch(e){asr=await T.pipeline('automatic-speech-recognition',id,{dtype:'q8',device:'wasm',progress_callback:p2});}
   asrModel=id;return asr;
 }
 // correction du texte : mots métier, ponctuation française, majuscules
