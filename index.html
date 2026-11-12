@@ -329,7 +329,7 @@ Aujourd'hui je vais vous montrer comment reprendre le contrôle de votre trésor
 </div>
 
 <script type="module">
-const APP_VERSION='2.5';
+const APP_VERSION='2.6';
 // =====================================================================
 // Utilities
 // =====================================================================
@@ -807,7 +807,9 @@ function perf(){const now=performance.now();if(lastF){ftimes.push(now-lastF);if(
     $('#fps').textContent=`⚡ ${fps} i/s · ${out.width}×${out.height}${GL?' · GPU':''}`;$('#fps').style.color=fps>=24?'#3CCB7F':'#E5484D';
     if(QUAL==='auto'&&!lowRes&&!recording&&fps<17){lowRes=true;ftimes=[];toast('Mode fluide activé : enregistrement en 720p');}}}
 function schedule(){if(video.videoWidth&&video.requestVideoFrameCallback&&!video.paused)video.requestVideoFrameCallback(()=>frame());else requestAnimationFrame(frame);}
+let switching=false;
 function frame(){
+  if(switching){if(recording)$('#timer').textContent=fmtT((performance.now()-recStart)/1000);requestAnimationFrame(frame);return;}
   perf();
   const [W,H]=recording?[out.width,out.height]:outDims(); if(out.width!==W||out.height!==H){out.width=W;out.height=H;}if(person.width!==W||person.height!==H){person.width=W;person.height=H;}
   const S=Math.min(W,H)/1080;
@@ -903,7 +905,7 @@ function addTake(blob,dur,subs){
 function renderTakes(){
   $('#takeCount').textContent=takes.length;const box=$('#takes');
   if(!takes.length){box.innerHTML='<div class="hint">Aucune prise.</div>';return;}
-  box.innerHTML='';takes.forEach(t=>{const d=document.createElement('div');d.className='take';
+  box.innerHTML='';takes.slice().reverse().forEach(t=>{const d=document.createElement('div');d.className='take';
     d.innerHTML=`<video src="${t.url}" controls playsinline preload="metadata"></video><div class="meta">${t.name} · ${fmtT(t.dur)} · ${t.fmt}</div><div class="row"><button class="btn sm">⬇︎</button><button class="btn sm">🗑</button></div>`;
     const [bD,bX]=d.querySelectorAll('button');bD.onclick=()=>dl(t.blob,`shenack_${t.name.replace(/\s/g,'_')}.${EXT}`);
     bX.onclick=()=>{takes.splice(takes.indexOf(t),1);renderTakes();};box.appendChild(d);});
@@ -1567,11 +1569,26 @@ if('serviceWorker' in navigator&&location.protocol==='https:'){navigator.service
 const PHONE=matchMedia('(pointer:coarse)').matches&&Math.min(screen.width,screen.height)<900;
 let facing='user';
 if(PHONE){$('#proSkin').value=10;$('#proNoise').value=15;$('#proSharp').value=50;$('#btnFlip').style.display='inline-block';}
-$('#btnFlip').onclick=async()=>{if(recording)return;facing=facing==='user'?'environment':'user';$('#mirror').checked=facing==='user';
-  try{const st=await navigator.mediaDevices.getUserMedia({video:{facingMode:{exact:facing},width:{ideal:1920},height:{ideal:1080}}});
-    if(camStream)camStream.getTracks().forEach(t=>t.stop());camStream=st;video.srcObject=st;await video.play();
-    const g=st.getVideoTracks()[0].getSettings();$('#camInfo').textContent=`Caméra ${facing==='user'?'avant':'arrière'} : ${g.width}×${g.height}`;toast(facing==='user'?'Caméra avant':'Caméra arrière : meilleure qualité d’image');listDevices();}
-  catch(e){toast('Impossible de changer de caméra');facing=facing==='user'?'environment':'user';}};
+$('#btnFlip').onclick=async()=>{
+  if(switching)return;switching=true;$('#btnFlip').disabled=true;
+  const prevFacing=facing,prevId=camStream&&camStream.getVideoTracks()[0].getSettings().deviceId;
+  facing=facing==='user'?'environment':'user';
+  const open=async c=>navigator.mediaDevices.getUserMedia({video:{...c,width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30}}});
+  // beaucoup de téléphones n'ouvrent qu'une caméra à la fois : on libère l'ancienne d'abord (l'enregistrement continue sur la dernière image)
+  if(camStream)camStream.getVideoTracks().forEach(t=>t.stop());
+  let st=null;
+  try{st=await open({facingMode:{exact:facing}});}catch(e){
+    try{const devs=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='videoinput'&&d.deviceId!==prevId);
+      const want=facing==='environment'?/back|rear|arri|environment/i:/front|avant|user|face/i;
+      const pick=devs.find(d=>want.test(d.label))||devs[0];if(pick)st=await open({deviceId:{exact:pick.deviceId}});}catch(e2){}}
+  if(!st){facing=prevFacing;try{st=await open(prevId?{deviceId:{exact:prevId}}:{facingMode:prevFacing});}catch(e3){}toast('Impossible de changer de caméra');}
+  if(st){camStream=st;video.srcObject=st;try{await video.play();}catch(e){}
+    await new Promise(r=>{if(video.requestVideoFrameCallback){video.requestVideoFrameCallback(()=>r());setTimeout(r,1500);}else setTimeout(r,300);});
+    $('#mirror').checked=facing==='user';
+    const g=st.getVideoTracks()[0].getSettings();$('#camInfo').textContent=`Caméra ${facing==='user'?'avant':'arrière'} : ${g.width}×${g.height}`;
+    toast((facing==='user'?'Caméra avant':'Caméra arrière')+(recording?' — l’enregistrement continue':''));}
+  switching=false;$("#btnFlip").disabled=false;listDevices();
+};
 
 // init
 listDevices();if(navigator.mediaDevices)navigator.mediaDevices.ondevicechange=listDevices;
